@@ -14,7 +14,7 @@ using Steamworks;
 
 namespace SpectatorPlus
 {
-    [BepInPlugin("com.spectatorplus.mod", "SpectatorPlus", "1.0.0")]
+    [BepInPlugin("com.spectatorplus.mod", "SpectatorPlus", "1.1.0")]
     [BepInProcess("MageArena.exe")]
     public class SpectatorPlus : BaseUnityPlugin
     {
@@ -24,6 +24,7 @@ namespace SpectatorPlus
         // Spectator state
         private static bool isSpectator = false;
         private static bool isFreecamMode = false;
+        private static bool isSpectateRoutineRunning = false;
         private static PlayerMovement spectateTarget = null;
         private static int currentPlayerIndex = 0;
         private static float spectateDistance = 5f; // Default zoom distance
@@ -49,6 +50,7 @@ namespace SpectatorPlus
         private static Vector3 originalCameraPosition;
         private static Quaternion originalCameraRotation;
         private static Transform originalCameraParent;
+        private static GameObject cameraUIObject;
 
         // BepInEx Configuration
         private static ConfigEntry<bool> configInvertMouseX;
@@ -69,14 +71,13 @@ namespace SpectatorPlus
             ModLogger = BepInEx.Logging.Logger.CreateLogSource("SpectatorPlus");
             ModLogger.LogInfo("SpectatorPlus mod loaded!");
 
-            // Initialize BepInEx configuration
             InitializeConfig();
-            
+
             harmony = new Harmony("com.spectatorplus.mod");
-            
-            // Apply Harmony patches
             harmony.PatchAll(typeof(SpectatorPlus).Assembly);
-            
+
+            SceneManager.sceneLoaded += OnSceneLoaded;
+
             ModLogger.LogInfo("Harmony patches applied!");
         }
 
@@ -199,7 +200,20 @@ namespace SpectatorPlus
 
         private void OnDestroy()
         {
+            SceneManager.sceneLoaded -= OnSceneLoaded;
             harmony?.UnpatchSelf();
+        }
+
+        private void OnSceneLoaded(Scene scene, LoadSceneMode mode)
+        {
+            // Clear spectator state on every scene load so it doesn't bleed into new sessions
+            isSpectator = false;
+            isFreecamMode = false;
+            isSpectateRoutineRunning = false;
+            spectateTarget = null;
+            currentPlayerIndex = 0;
+            cameraUIObject = null;
+            ModLogger?.LogInfo($"Scene loaded ({scene.name}) - spectator state cleared");
         }
 
         private void Update()
@@ -252,9 +266,7 @@ namespace SpectatorPlus
 
         internal static PlayerRespawnManager GetPlayerRespawnManager(PlayerMovement pm)
         {
-            if (pm == null) return null;
-            
-            return pm.prm;
+            return PlayerRespawnManager.instance;
         }
 
         #region Harmony Patches
@@ -323,17 +335,42 @@ namespace SpectatorPlus
         [HarmonyPatch(typeof(PlayerRespawnManager), "SpectateRoutine")]
         internal static class CustomSpectateRoutinePatch
         {
-            private static bool Prefix(PlayerRespawnManager __instance)
+            private static bool Prefix(PlayerRespawnManager __instance, ref IEnumerator __result)
             {
                 SpectatorPlus.ModLogger?.LogInfo("SpectateRoutine called");
                 if (SpectatorPlus.IsSpectatorPlayer(__instance.pmv))
                 {
                     SpectatorPlus.ModLogger?.LogInfo("Starting custom spectate routine for spectator");
-                    // Start our custom spectate routine that ignores team restrictions
                     __instance.StartCoroutine(SpectatorPlus.CustomSpectateCoroutine(__instance));
-                    return false; // Skip original method
+                    __result = SpectatorPlus.NoOpCoroutine();
+                    return false;
                 }
                 return true;
+            }
+        }
+
+        [HarmonyPatch(typeof(SpawnWormHole), "TelePlayer", new System.Type[] { typeof(Collider) })]
+        internal static class TelePlayerSpectatorPatch
+        {
+            private static bool Prefix(SpawnWormHole __instance, Collider other)
+            {
+                PlayerMovement pm;
+                if (!other.TryGetComponent<PlayerMovement>(out pm)) return true;
+                if (!SpectatorPlus.IsSpectatorPlayer(pm)) return true;
+
+                SpectatorPlus.ModLogger?.LogInfo("Host entered wormhole - starting spectate mode");
+                SpectatorPlus.SetPlayerHealth(pm, 0f);
+                pm.isDead = true;
+                isSpectator = true;
+                SpectatorPlus.HideUIComponents();
+                AccessTools.Field(typeof(SpawnWormHole), "tellied").SetValue(__instance, true);
+
+                PlayerRespawnManager prm = GetPlayerRespawnManager(pm);
+                if (prm != null)
+                {
+                    prm.StartCoroutine(SpectatorPlus.CustomSpectateCoroutine(prm));
+                }
+                return false;
             }
         }
 
@@ -389,13 +426,13 @@ namespace SpectatorPlus
                 }
 
                 // Check if we're in a lobby
-                if (BootstrapManager.CurrentLobbyID == 0)
+                if (BootstrapManager.instance.CurrentLobbyID == 0)
                 {
                     return false;
                 }
 
                 // Get the lobby owner and local player Steam IDs
-                CSteamID lobbyId = new CSteamID(BootstrapManager.CurrentLobbyID);
+                CSteamID lobbyId = new CSteamID(BootstrapManager.instance.CurrentLobbyID);
                 CSteamID ownerId = SteamMatchmaking.GetLobbyOwner(lobbyId);
                 CSteamID localId = SteamUser.GetSteamID();
 
@@ -423,21 +460,37 @@ namespace SpectatorPlus
             }
             
             ModLogger.LogInfo("Hiding UI components for spectator mode");
-            
+
+            // Hide the UI object parented to Main Camera
+            Camera mainCamera = Camera.main;
+            if (mainCamera != null)
+            {
+                Transform camUI = mainCamera.transform.Find("ui");
+                if (camUI != null)
+                {
+                    cameraUIObject = camUI.gameObject;
+                    cameraUIObject.SetActive(false);
+                    ModLogger.LogInfo("Hidden Main Camera/UI");
+                }
+                else
+                {
+                    ModLogger.LogWarning("Main Camera/UI not found");
+                }
+            }
+
             // Check if SceneManager is available
             if (SceneManager.sceneCount == 0)
             {
                 ModLogger.LogWarning("No scenes loaded, cannot hide UI components");
                 return;
             }
-            
+
             // Hide GameScene UI components
             Scene gameScene = SceneManager.GetSceneByName("GameScene");
             if (gameScene.isLoaded)
             {
                 ModLogger.LogInfo("Found GameScene, hiding inventory and level up UI");
-                
-                // Find Canvas root object and hide INVUI
+
                 GameObject[] rootObjects = gameScene.GetRootGameObjects();
                 if (rootObjects != null)
                 {
@@ -451,7 +504,7 @@ namespace SpectatorPlus
                                 invUI.gameObject.SetActive(false);
                                 ModLogger.LogInfo("Hidden Canvas/INVUI");
                             }
-                            
+
                             Transform lvlUpText = rootObj.transform.Find("lvluptext");
                             if (lvlUpText != null)
                             {
@@ -478,14 +531,22 @@ namespace SpectatorPlus
             }
             
             ModLogger.LogInfo("Restoring UI components");
-            
+
+            // Restore Main Camera/UI
+            if (cameraUIObject != null)
+            {
+                cameraUIObject.SetActive(true);
+                ModLogger.LogInfo("Restored Main Camera/UI");
+                cameraUIObject = null;
+            }
+
             // Check if SceneManager is available
             if (SceneManager.sceneCount == 0)
             {
                 ModLogger.LogWarning("No scenes loaded, cannot restore UI components");
                 return;
             }
-            
+
             // Restore GameScene UI components
             Scene gameScene = SceneManager.GetSceneByName("GameScene");
             if (gameScene.isLoaded)
@@ -503,7 +564,7 @@ namespace SpectatorPlus
                                 invUI.gameObject.SetActive(true);
                                 ModLogger.LogInfo("Restored Canvas/INVUI");
                             }
-                            
+
                             Transform lvlUpText = rootObj.transform.Find("lvluptext");
                             if (lvlUpText != null)
                             {
@@ -590,16 +651,19 @@ namespace SpectatorPlus
 
         internal static IEnumerator CustomSpectateCoroutine(PlayerRespawnManager manager)
         {
+            if (isSpectateRoutineRunning) yield break;
+            isSpectateRoutineRunning = true;
+            isSpectator = true;
+
             ModLogger.LogInfo("Starting custom spectate routine");
-            
-            // Validate manager reference
+
             if (manager == null)
             {
                 ModLogger.LogError("PlayerRespawnManager is null in CustomSpectateCoroutine");
+                isSpectateRoutineRunning = false;
                 yield break;
             }
-            
-            // Wait a bit for everything to settle
+
             yield return new WaitForSeconds(0.5f);
             
             // Find all players and start spectating the first alive one
@@ -651,27 +715,25 @@ namespace SpectatorPlus
             if (firstAlivePlayer == null)
             {
                 ModLogger.LogWarning("No alive players found for spectating");
+                isSpectateRoutineRunning = false;
                 yield break;
             }
 
-            // Start spectating the first alive player
             ModLogger.LogInfo($"Starting to spectate {firstAlivePlayer.playername}");
             StartSpectating(firstAlivePlayer);
-            
-            // Main spectate loop
+
             while (isSpectator)
             {
                 yield return null;
-                
                 UpdateSpectateCamera();
-                // Check if current target is still alive
                 if (spectateTarget == null || !IsPlayerAlive(spectateTarget))
                 {
                     ModLogger.LogInfo("Current spectate target is no longer valid, cycling to next player");
-                    // Find next alive player
                     CycleToNextPlayer();
                 }
             }
+
+            isSpectateRoutineRunning = false;
         }
 
         internal static void StartSpectating(PlayerMovement targetPlayer)
@@ -886,6 +948,7 @@ namespace SpectatorPlus
             RestoreUIComponents();
             isSpectator = false;
             isFreecamMode = false;
+            isSpectateRoutineRunning = false;
             spectateTarget = null;
             currentPlayerIndex = 0;
             ModLogger.LogInfo("All states reset.");
